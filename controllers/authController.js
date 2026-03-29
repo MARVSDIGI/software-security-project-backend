@@ -1,7 +1,11 @@
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const validator = require("validator");
+const crypto = require("crypto");
 const pool = require("../config/db");
+const { logEvent } = require("../utils/auditLogger");
+
+// ================= HELPERS =================
 
 const sanitizeText = (value) => {
   if (typeof value !== "string") return "";
@@ -10,7 +14,7 @@ const sanitizeText = (value) => {
 
 const getPasswordStrength = (password) => {
   if (password.length < 8) return "WEAK";
-  if (password.length === 8 || password.length === 9) return "MEDIUM";
+  if (password.length <= 10) return "MEDIUM";
   return "STRONG";
 };
 
@@ -20,39 +24,24 @@ const isStrongPassword = (password) => {
   const hasNumber = /[0-9]/.test(password);
   const hasSpecial = /[^A-Za-z0-9]/.test(password);
 
-  const forbiddenPatterns = [
-    "123",
-    "password",
-    "qwerty",
-    "abc",
-    "111",
-    "000"
-  ];
-
-  const containsForbidden = forbiddenPatterns.some((pattern) =>
-    password.toLowerCase().includes(pattern)
-  );
-
-  const hasRepeating = /(.)\1{2,}/.test(password);
-
   return (
     password.length >= 8 &&
     hasUpper &&
     hasLower &&
     hasNumber &&
-    hasSpecial &&
-    !containsForbidden &&
-    !hasRepeating
+    hasSpecial
   );
 };
 
 const buildUserResponse = (user) => ({
   id: user.id,
-  firstName: user.first_name || user.firstName,
-  lastName: user.last_name || user.lastName,
+  firstName: user.first_name,
+  lastName: user.last_name,
   email: user.email,
   role: user.role
 });
+
+// ================= SIGNUP =================
 
 const signup = async (req, res) => {
   try {
@@ -60,8 +49,8 @@ const signup = async (req, res) => {
 
     firstName = sanitizeText(firstName);
     lastName = sanitizeText(lastName);
-    email = typeof email === "string" ? email.trim().toLowerCase() : "";
-    password = typeof password === "string" ? password.trim() : "";
+    email = email?.toLowerCase().trim();
+    password = password?.trim();
 
     if (!firstName || !lastName || !email || !password) {
       return res.status(400).json({
@@ -73,26 +62,23 @@ const signup = async (req, res) => {
     if (!validator.isEmail(email)) {
       return res.status(400).json({
         success: false,
-        message: "Invalid email format"
+        message: "Invalid email"
       });
     }
 
     if (!isStrongPassword(password)) {
       return res.status(400).json({
         success: false,
-        message:
-          "Password must be at least 8 characters, include uppercase, lowercase, number, special character, and must not contain weak patterns."
+        message: "Weak password"
       });
     }
 
-    const passwordStrength = getPasswordStrength(password);
-
-    const [existingUsers] = await pool.query(
+    const [existing] = await pool.query(
       "SELECT id FROM users WHERE email = ?",
       [email]
     );
 
-    if (existingUsers.length > 0) {
+    if (existing.length > 0) {
       return res.status(400).json({
         success: false,
         message: "Email already exists"
@@ -100,243 +86,201 @@ const signup = async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
+    const strength = getPasswordStrength(password);
 
     const [result] = await pool.query(
-      `
-      INSERT INTO users (first_name, last_name, email, password_hash, password_strength, role)
-      VALUES (?, ?, ?, ?, ?, ?)
-      `,
-      [firstName, lastName, email, passwordHash, passwordStrength, "user"]
+      `INSERT INTO users (first_name, last_name, email, password_hash, password_strength, role)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [firstName, lastName, email, passwordHash, strength, "user"]
     );
+
+    await logEvent(req, result.insertId, "USER_SIGNUP");
 
     return res.status(201).json({
       success: true,
-      message: "Signup successful",
-      user: {
-        id: result.insertId,
-        firstName,
-        lastName,
-        email,
-        role: "user",
-        passwordStrength
-      }
+      message: "Signup successful"
     });
-  } catch (error) {
-    console.error("Signup error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Server error during signup"
-    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Server error" });
   }
 };
+
+// ================= LOGIN =================
 
 const login = async (req, res) => {
   try {
     let { email, password } = req.body;
 
-    email = typeof email === "string" ? email.trim().toLowerCase() : "";
-    password = typeof password === "string" ? password.trim() : "";
-
-    if (!email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: "Email and password are required"
-      });
-    }
-
-    if (!validator.isEmail(email)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid email format"
-      });
-    }
+    email = email?.toLowerCase().trim();
+    password = password?.trim();
 
     const [users] = await pool.query(
-      `
-      SELECT
-        id,
-        first_name,
-        last_name,
-        email,
-        password_hash,
-        role,
-        failed_attempts,
-        last_failed_attempt_at,
-        lock_until,
-        consecutive_failed_attempts,
-        first_failed_attempt_at,
-        lock_level
-      FROM users
-      WHERE email = ?
-      `,
+      "SELECT * FROM users WHERE email = ?",
       [email]
     );
 
     if (users.length === 0) {
       return res.status(400).json({
         success: false,
-        message: "Invalid email or password"
+        message: "Invalid credentials"
       });
     }
 
     const user = users[0];
-    const now = new Date();
 
-    if (user.lock_until && new Date(user.lock_until) > now) {
-      return res.status(403).json({
-        success: false,
-        message: "Account locked. Try again later."
-      });
-    }
+    const match = await bcrypt.compare(password, user.password_hash);
 
-    const isMatch = await bcrypt.compare(password, user.password_hash);
-
-    if (!isMatch) {
-      let failedAttempts = user.failed_attempts || 0;
-      let lastFailed = user.last_failed_attempt_at;
-      let consecutiveFails = user.consecutive_failed_attempts || 0;
-      let firstFailed = user.first_failed_attempt_at;
-      let lockLevel = user.lock_level || 0;
-
-      if (lastFailed) {
-        const diffMinutes = (now - new Date(lastFailed)) / (1000 * 60);
-        if (diffMinutes > 60) {
-          failedAttempts = 0;
-        }
-      }
-
-      if (firstFailed) {
-        const diffHours = (now - new Date(firstFailed)) / (1000 * 60 * 60);
-        if (diffHours > 24) {
-          consecutiveFails = 0;
-          firstFailed = now;
-        }
-      } else {
-        firstFailed = now;
-      }
-
-      failedAttempts += 1;
-      consecutiveFails += 1;
-
-      let lockUntil = null;
-
-      if (consecutiveFails >= 8) {
-        lockUntil = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-      }
-
-      if (failedAttempts >= 3) {
-        if (lockLevel === 0) {
-          lockUntil = new Date(now.getTime() + 1 * 60 * 60 * 1000);
-          lockLevel = 1;
-        } else if (lockLevel === 1) {
-          lockUntil = new Date(now.getTime() + 2 * 60 * 60 * 1000);
-          lockLevel = 2;
-        } else {
-          lockUntil = new Date(now.getTime() + 24 * 60 * 60 * 1000);
-          lockLevel = 3;
-        }
-        failedAttempts = 0;
-      }
-
-      await pool.query(
-        `
-        UPDATE users
-        SET
-          failed_attempts = ?,
-          last_failed_attempt_at = ?,
-          consecutive_failed_attempts = ?,
-          first_failed_attempt_at = ?,
-          lock_until = ?,
-          lock_level = ?
-        WHERE id = ?
-        `,
-        [
-          failedAttempts,
-          now,
-          consecutiveFails,
-          firstFailed,
-          lockUntil,
-          lockLevel,
-          user.id
-        ]
-      );
+    if (!match) {
+      await logEvent(req, user.id, "LOGIN_FAILED");
 
       return res.status(400).json({
         success: false,
-        message: "Invalid email or password"
+        message: "Invalid credentials"
       });
     }
 
-    await pool.query(
-      `
-      UPDATE users
-      SET
-        failed_attempts = 0,
-        last_failed_attempt_at = NULL,
-        consecutive_failed_attempts = 0,
-        first_failed_attempt_at = NULL,
-        lock_until = NULL
-      WHERE id = ?
-      `,
-      [user.id]
-    );
-
     const token = jwt.sign(
-      { id: user.id, email: user.email, role: user.role },
+      { id: user.id, email: user.email },
       process.env.JWT_SECRET,
-      { expiresIn: process.env.JWT_EXPIRES_IN || "8h" }
+      { expiresIn: process.env.JWT_EXPIRES_IN || "1h" }
     );
 
-    return res.status(200).json({
+    await logEvent(req, user.id, "LOGIN_SUCCESS");
+
+    res.json({
       success: true,
-      message: "Login successful",
       token,
-      authToken: token,
-      accessToken: token,
       user: buildUserResponse(user)
     });
-  } catch (error) {
-    console.error("Login error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Server error during login"
-    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: "Server error" });
   }
 };
+
+// ================= FORGOT PASSWORD =================
+
+const forgotPassword = async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    const [users] = await pool.query(
+      "SELECT id FROM users WHERE email = ?",
+      [email]
+    );
+
+    if (users.length === 0) {
+      return res.json({
+        success: true,
+        message: "If email exists, reset token sent"
+      });
+    }
+
+    const user = users[0];
+
+    const token = crypto.randomBytes(32).toString("hex");
+
+    const hashed = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
+
+    const expires = new Date(Date.now() + 15 * 60 * 1000);
+
+    await pool.query(
+      `UPDATE users
+       SET reset_password_token_hash = ?, reset_password_expires_at = ?
+       WHERE id = ?`,
+      [hashed, expires, user.id]
+    );
+
+    await logEvent(req, user.id, "PASSWORD_RESET_REQUESTED");
+
+    res.json({
+      success: true,
+      resetToken: token,
+      expires
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false });
+  }
+};
+
+// ================= RESET PASSWORD =================
+
+const resetPassword = async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+
+    const hashed = crypto
+      .createHash("sha256")
+      .update(token)
+      .digest("hex");
+
+    const [users] = await pool.query(
+      `SELECT id FROM users
+       WHERE reset_password_token_hash = ?
+       AND reset_password_expires_at > NOW()`,
+      [hashed]
+    );
+
+    if (users.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid or expired token"
+      });
+    }
+
+    const user = users[0];
+
+    const newHash = await bcrypt.hash(newPassword, 10);
+
+    await pool.query(
+      `UPDATE users
+       SET password_hash = ?, reset_password_token_hash = NULL,
+       reset_password_expires_at = NULL
+       WHERE id = ?`,
+      [newHash, user.id]
+    );
+
+    await logEvent(req, user.id, "PASSWORD_RESET_SUCCESS");
+
+    res.json({
+      success: true,
+      message: "Password reset successful"
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false });
+  }
+};
+
+// ================= CURRENT USER =================
 
 const getCurrentUser = async (req, res) => {
   try {
     const [users] = await pool.query(
-      `
-      SELECT id, first_name, last_name, email, role
-      FROM users
-      WHERE id = ?
-      `,
+      "SELECT id, first_name, last_name, email FROM users WHERE id = ?",
       [req.user.id]
     );
 
-    if (users.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "User not found"
-      });
-    }
-
-    return res.status(200).json({
+    res.json({
       success: true,
-      user: buildUserResponse(users[0])
+      user: users[0]
     });
-  } catch (error) {
-    console.error("Get current user error:", error);
-    return res.status(500).json({
-      success: false,
-      message: "Server error"
-    });
+  } catch (err) {
+    res.status(500).json({ success: false });
   }
 };
+
+// ================= EXPORT =================
 
 module.exports = {
   signup,
   login,
+  forgotPassword,
+  resetPassword,
   getCurrentUser
 };
